@@ -4,7 +4,7 @@
 
 SOURCE_MODE = "serial"   # "serial" | "ble" | "simulated"
 
-SERIAL_PORT = "COM20"     # Cambia al puerto que aparece en tu PC
+SERIAL_PORT = "auto"     # Detecta el puerto del Xiao nRF52840 automáticamente
 SERIAL_BAUD = 2000000
 
 BLE_ADDRESS = "AA:BB:CC:DD:EE:FF"

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m venv venv)",
+      "Bash(venv/Scripts/pip install *)",
+      "Bash(venv/Scripts/python -c \"import PyQt6; import pyqtgraph; import serial; import bleak; print\\('Todas las dependencias OK'\\)\")",
+      "Bash(venv/Scripts/python main.py)",
+      "PowerShell(Get-WmiObject *)",
+      "Bash(git config *)",
+      "Bash(git init *)",
+      "Bash(git remote *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(venv/Scripts/python.exe main.py)",
+      "Bash(venv/Scripts/python.exe -c \"import sys; from PyQt6.QtWidgets import QApplication; print\\('PyQt6 OK'\\)\")",
+      "Bash(start venv/Scripts/pythonw.exe main.py)",
+      "Bash(python interf_emg.py)",
+      "Bash(pip install *)",
+      "Bash(python -c \"import interf_emg\")"
+    ]
+  }
+}

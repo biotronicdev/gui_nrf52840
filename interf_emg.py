@@ -112,53 +112,26 @@ def auto_detect_serial_port() -> Optional[str]:
     return None
 
 
-# Función que intenta convertir un payload recibido en 3 floats
-def parse_payload_to_3floats(payload: bytes) -> Optional[List[float]]:
+# Función que convierte un payload CSV del nRF a (t_firmware_s, [emg_centrado, gx, gy, gz])
+def parse_payload(payload: bytes) -> Optional[tuple]:
     """
-    Soporta:
-    1) Texto CSV: b"0.12,-0.03,0.44\\n"
-    2) Binario int16: 6 bytes => 3 canales
+    Espera formato: timestamp_us,emg_raw,gx,gy,gz
+    Retorna (t_segundos, [emg_centrado, gx, gy, gz]) usando el timestamp del firmware.
+    El timestamp del firmware preserva el espaciado real entre muestras (2 ms a 500 Hz),
+    evitando los "clusters" que produce time.time() cuando llegan ráfagas por serial.
+    Ignora líneas que comiencen con '#'.
     """
-
-    # Primer intento: interpretar como texto UTF-8 CSV o valor único
     try:
-        # Convierte bytes a string y quita espacios o saltos de línea
         s = payload.decode("utf-8", errors="strict").strip()
-
-        # Revisa que la cadena no está vacía
-        if s:
-            # Parte por comas y limpia espacios
-            parts = [p.strip() for p in s.split(",")]
-
-            # Si hay 3 o más valores separados por coma
-            if len(parts) >= 3:
-                return [float(parts[0]), float(parts[1]), float(parts[2])]
-
-            # Si hay un solo valor (ej. "248\n"), lo manda al canal 1
-            if len(parts) == 1:
-                val = float(parts[0])
-                return [val, 0.0, 0.0]
-    except Exception:
-        # Si falla pasa a un segundo intento
-        pass
-
-    # Segundo intento en interpretar como 3 enteros de 16 bits
-    if len(payload) >= 6: #cada canal ocupa 2 bytes, 3 chan por 2 bytes = 6 bytes 
-        try:
-            # struct para desempacar bytes binarios, interpreta como numeros 
-            import struct
-
-            # Desempaca 3 enteros con little-endian o sea que l bit menos significativo va primero
-            ch1, ch2, ch3 = struct.unpack("<hhh", payload[:6])
-            # h es un entero de 16 bits con signo, hhh son tres enteros seguidos 
-
-            # Escala los enteros a valores reales
-            return [ch1 * INT16_SCALE, ch2 * INT16_SCALE, ch3 * INT16_SCALE]
-        except Exception:
-            # Si falla regresa None
+        if not s or s.startswith("#"):
             return None
-
-    # Si no se pudo interpretar regresa None
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) >= 5:
+            t = float(parts[0]) / 1_000_000.0
+            emg = float(parts[1]) - 2048.0
+            return (t, [emg, float(parts[2]), float(parts[3]), float(parts[4])])
+    except Exception:
+        pass
     return None
 
 
@@ -189,27 +162,30 @@ class SimulatedEMGSource(DataSource):
         # Tiempo relativo desde que inició, cuantos s han pasado desde que incio 
         t = time.time() - self.t0
 
-        # Señal base lenta tipo seno
-        base = 0.08 * math.sin(2 * math.pi * 2.0 * t)
+        # Señal base lenta tipo seno (escala ADC centrada en 0)
+        base = 80 * math.sin(2 * math.pi * 2.0 * t)
 
         # Componente burst rápida
         burst = 0.0
 
         # Cada ciertos segundos mete ráfagas
         if int(t) % 5 in (2, 3):
-            burst = 0.35 * math.sin(2 * math.pi * 40.0 * t)
+            burst = 350 * math.sin(2 * math.pi * 40.0 * t)
 
         # Canal 1 = base + burst + ruido
-        ch1 = base + burst + random.uniform(-0.08, 0.08)
+        ch1 = base + burst + random.uniform(-80, 80)
 
         # Canal 2 = variación del canal 1
-        ch2 = 0.9 * base + 0.8 * burst + random.uniform(-0.08, 0.08)
+        ch2 = 0.9 * base + 0.8 * burst + random.uniform(-80, 80)
 
         # Canal 3 = otra variación
-        ch3 = 1.1 * base + 0.6 * burst + random.uniform(-0.08, 0.08)
+        ch3 = 1.1 * base + 0.6 * burst + random.uniform(-80, 80)
 
-        # Regresa muestra con tiempo y los 3 canales
-        return Sample(t=t, values=[ch1, ch2, ch3])
+        # Canal 4 = gz simulado
+        gz = 0.7 * base + 0.4 * burst + random.uniform(-80, 80)
+
+        # Regresa muestra con tiempo y los 4 canales
+        return Sample(t=t, values=[ch1, ch2, ch3, gz])
 
 
 # Fuente de datos por puerto serial
@@ -244,6 +220,9 @@ class NRFSerialSource(DataSource):
         # Tiempo inicial
         self._t0 = 0.0
 
+        # Baseline del timestamp del firmware (se fija con la primera muestra)
+        self._t0_fw: Optional[float] = None
+
         # Objeto serial
         self._ser = None
 
@@ -268,6 +247,9 @@ class NRFSerialSource(DataSource):
 
         # Reinicia tiempo base
         self._t0 = time.time()
+
+        # Reinicia baseline de firmware (se fija con la primera muestra recibida)
+        self._t0_fw = None
 
         # Crea hilo lector
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -315,39 +297,22 @@ class NRFSerialSource(DataSource):
                 # Agrega lo leído al buffer
                 buffer.extend(chunk)
 
-                # Si llegaron líneas CSV completas
+                # Procesa líneas CSV completas
                 while b"\n" in buffer:
-                    # Separa una línea y lo restante
                     line, _, rest = buffer.partition(b"\n")
-
-                    # Actualiza buffer con lo que sobró
                     buffer = bytearray(rest)
-
-                    # Limpia espacios y saltos
                     payload = line.strip()
-
-                    # Si la línea quedó vacía, la ignora
                     if not payload:
                         continue
-
-                    # Intenta convertir payload en 3 floats
-                    vals = parse_payload_to_3floats(payload)
-
-                    # Si sí obtuvo 3 valores
-                    if vals and len(vals) >= 3:
-                        t = time.time() - self._t0
-                        with self._lock:
-                            self._buffer.append(Sample(t=t, values=vals[:3]))
-
-                # Si no hay saltos de línea, intenta procesar binario puro de 6 bytes
-                while len(buffer) >= 6 and b"\n" not in buffer:
-                    payload = bytes(buffer[:6])
-                    del buffer[:6]
-                    vals = parse_payload_to_3floats(payload)
-                    if vals and len(vals) >= 3:
-                        t = time.time() - self._t0
-                        with self._lock:
-                            self._buffer.append(Sample(t=t, values=vals[:3]))
+                    result = parse_payload(payload)
+                    if result is None:
+                        continue
+                    t_fw, vals = result
+                    if self._t0_fw is None:
+                        self._t0_fw = t_fw
+                    t = t_fw - self._t0_fw
+                    with self._lock:
+                        self._buffer.append(Sample(t=t, values=vals))
 
             except Exception:
                 # Si algo falla, sigue intentando para no tirar la app
@@ -393,6 +358,9 @@ class NRFBLESource(DataSource):
         # Tiempo inicial
         self._t0 = 0.0
 
+        # Baseline del timestamp del firmware (se fija con la primera muestra)
+        self._t0_fw: Optional[float] = None
+
         # Hilo BLE
         self._thread: Optional[threading.Thread] = None
 
@@ -410,6 +378,9 @@ class NRFBLESource(DataSource):
 
         # Guarda tiempo base
         self._t0 = time.time()
+
+        # Reinicia baseline de firmware (se fija con la primera muestra recibida)
+        self._t0_fw = None
 
         # Crea hilo para el loop async
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -455,20 +426,16 @@ class NRFBLESource(DataSource):
     async def _ble_task(self):
         # Callback que se ejecuta cada vez que llegan notificaciones
         def on_notify(_, data: bytearray):
-            # Parsea bytes a 3 floats
-            vals = parse_payload_to_3floats(bytes(data))
-
-            # Si obtuvo 3 valores
-            if vals and len(vals) >= 3:
-                # Tiempo relativo
-                t = time.time() - self._t0
-
-                # Crea muestra
-                s = Sample(t=t, values=vals[:3])
-
-                # Guarda última muestra
-                with self._lock:
-                    self._latest = s
+            result = parse_payload(bytes(data))
+            if result is None:
+                return
+            t_fw, vals = result
+            if self._t0_fw is None:
+                self._t0_fw = t_fw
+            t = t_fw - self._t0_fw
+            s = Sample(t=t, values=vals)
+            with self._lock:
+                self._latest = s
 
         # Abre conexión BLE
         async with BleakClient(self.address) as client:
@@ -495,35 +462,31 @@ class NRFBLESource(DataSource):
 # Widget que representa un monitor individual de señal
 class MonitorEMG(QWidget):
     # Constructor
-    def __init__(self, title_default="EMG", channel_index=0):
+    def __init__(self, title_default="EMG", channel_index=0, num_channels=1):
         super().__init__()
 
         # Índice del canal asociado
         self.channel_index = channel_index
 
-        # Si el trigger está armado
-        self.armed = False
-
-        # Si está capturando
-        self.capturing = False
-
-        # Si ya se disparó el trigger
-        self.triggered = False
+        # Número de señales que dibuja este monitor (1 = EMG, 3 = Giroscopio)
+        self.num_channels = num_channels
 
         # Máximo de puntos a dibujar (2 segundos a 500 Hz)
         self.max_points = 1000
 
-        # Cola de tiempos
-        self.x = deque(maxlen=self.max_points)
+        # Colas de tiempos y amplitudes por canal
+        self.x_data = [deque(maxlen=self.max_points) for _ in range(num_channels)]
+        self.y_data = [deque(maxlen=self.max_points) for _ in range(num_channels)]
 
-        # Cola de amplitudes
-        self.y = deque(maxlen=self.max_points)
+        # Alias para compatibilidad con canal único
+        self.x = self.x_data[0]
+        self.y = self.y_data[0]
 
         # Altura mínima del widget
-        self.setMinimumHeight(205)
+        self.setMinimumHeight(160)
 
         # Altura máxima del widget
-        self.setMaximumHeight(240)
+        self.setMaximumHeight(190)
 
         # Layout principal del monitor
         outer = QVBoxLayout(self)
@@ -592,72 +555,29 @@ class MonitorEMG(QWidget):
         self.plot.getAxis("left").setPen("#7f8ea3")
         self.plot.getAxis("bottom").setPen("#7f8ea3")
 
-        # Crea curva vacía
-        self.curve = self.plot.plot([], [], pen=pg.mkPen("#4f8cff", width=2))
+        # Colores y etiquetas por canal
+        _colors = ["#4f8cff", "#ff6b6b", "#4ade80"]
+        _labels = ["X", "Y", "Z"]
+
+        # Agrega leyenda si hay más de un canal
+        if num_channels > 1:
+            self.plot.addLegend(offset=(5, 5))
+
+        # Crea una curva por canal
+        self.curves = [
+            self.plot.plot(
+                [], [],
+                pen=pg.mkPen(_colors[i % 3], width=2),
+                name=_labels[i] if num_channels > 1 else title_default,
+            )
+            for i in range(num_channels)
+        ]
+
+        # Alias para compatibilidad con canal único
+        self.curve = self.curves[0]
 
         # Mete la gráfica al layout
         plot_layout.addWidget(self.plot)
-
-        # Layout horizontal para controles
-        controls = QHBoxLayout()
-
-        # Espacio entre controles
-        controls.setSpacing(6)
-
-        # Botón para armar/desarmar trigger
-        self.btn_arm = QPushButton("Armar trigger")
-
-        # Conecta click del botón con método toggle_arm
-        self.btn_arm.clicked.connect(self.toggle_arm)
-
-        # Combo de tipo de trigger
-        self.cmb_trigger = QComboBox()
-
-        # Agrega opciones
-        self.cmb_trigger.addItems(["Manual", "Umbral"])
-
-        # Si cambia el combo, actualiza botones
-        self.cmb_trigger.currentTextChanged.connect(self._mode_changed)
-
-        # Spin para umbral
-        self.spin_threshold = QDoubleSpinBox()
-
-        # Número de decimales
-        self.spin_threshold.setDecimals(3)
-
-        # Rango
-        self.spin_threshold.setRange(0.0, 10.0)
-
-        # Paso entre valores
-        self.spin_threshold.setSingleStep(0.01)
-
-        # Valor inicial
-        self.spin_threshold.setValue(0.25)
-
-        # Botón disparar para trigger manual
-        self.btn_fire = QPushButton("Disparar")
-
-        # Conecta a manual_fire
-        self.btn_fire.clicked.connect(self.manual_fire)
-
-        # Empieza deshabilitado
-        self.btn_fire.setEnabled(False)
-
-        # Etiqueta de estado
-        self.lbl_state = QLabel("Estado: en espera")
-
-        # Estilo de estado
-        self.lbl_state.setStyleSheet("color: gray; font-weight: 600;")
-
-        # Mete controles al layout
-        controls.addWidget(self.btn_arm)
-        controls.addWidget(QLabel("Tipo:"))
-        controls.addWidget(self.cmb_trigger)
-        controls.addWidget(QLabel("Umbral:"))
-        controls.addWidget(self.spin_threshold)
-        controls.addWidget(self.btn_fire)
-        controls.addStretch()
-        controls.addWidget(self.lbl_state)
 
         # Agrega título al monitor
         outer.addWidget(self.titulo1)
@@ -665,97 +585,28 @@ class MonitorEMG(QWidget):
         # Agrega gráfica
         outer.addWidget(plot_frame)
 
-        # Agrega fila de controles
-        outer.addLayout(controls)
 
-    # Método llamado cuando cambia el tipo de trigger
-    def _mode_changed(self, _):
-        # Si está armado, habilita disparo manual solo si el modo es Manual
-        if self.armed:
-            self.btn_fire.setEnabled(self.cmb_trigger.currentText() == "Manual")
+    # Recibe muestras nuevas (solo acumula, no redibuja — usar flush() para refrescar)
+    def push_sample(self, t: float, values: List[float]):
+        for i, v in enumerate(values[:self.num_channels]):
+            self.x_data[i].append(t)
+            self.y_data[i].append(v)
 
-    # Arma o desarma trigger
-    def toggle_arm(self):
-        # Invierte estado
-        self.armed = not self.armed
-
-        # Si quedó armado
-        if self.armed:
-            # Resetea banderas
-            self.capturing = False
-            self.triggered = False
-
-            # Cambia texto del botón
-            self.btn_arm.setText("Desarmar")
-
-            # Habilita o no el botón disparar según el modo
-            self.btn_fire.setEnabled(self.cmb_trigger.currentText() == "Manual")
-
-            # Cambia estado visual
-            self.lbl_state.setText("Estado: trigger armado")
-            self.lbl_state.setStyleSheet("color: #f0a500; font-weight: 600;")
-        else:
-            # Si se desarma
-            self.btn_arm.setText("Armar trigger")
-            self.btn_fire.setEnabled(False)
-            self.capturing = False
-            self.triggered = False
-            self.lbl_state.setText("Estado: en espera")
-            self.lbl_state.setStyleSheet("color: gray; font-weight: 600;")
-
-    # Dispara manualmente el trigger
-    def manual_fire(self):
-        # Solo si está armado y en modo manual
-        if self.armed and self.cmb_trigger.currentText() == "Manual":
-            self._set_triggered()
-
-    # Cambia a estado de captura
-    def _set_triggered(self):
-        # Marca que se disparó
-        self.triggered = True
-
-        # Marca que ya captura
-        self.capturing = True
-
-        # Cambia texto de estado
-        self.lbl_state.setText("Estado: CAPTURANDO")
-
-        # Color verde
-        self.lbl_state.setStyleSheet("color: #22c55e; font-weight: 700;")
-
-        # Limpia datos previos dibujados
-        self.x.clear()
-        self.y.clear()
-
-    # Recibe una muestra nueva para este monitor
-    def push_sample(self, t: float, value: float):
-        # Si no está armado, no hace nada
-        if not self.armed:
+    # Refresca la gráfica una sola vez con todos los puntos acumulados
+    def flush(self):
+        if not self.x_data[0]:
             return
-
-        # Lee modo actual
-        mode = self.cmb_trigger.currentText()
-
-        # Si el modo es umbral y aún no se disparó
-        if mode == "Umbral" and not self.triggered:
-            # Lee el umbral
-            thr = float(self.spin_threshold.value())
-
-            # Si el valor rebasa el umbral
-            if abs(value) >= thr:
-                self._set_triggered()
-
-        # Si ya está capturando, agrega y redibuja
-        if self.capturing:
-            self.x.append(t)
-            self.y.append(value)
-            self.curve.setData(list(self.x), list(self.y))
+        for i in range(self.num_channels):
+            self.curves[i].setData(list(self.x_data[i]), list(self.y_data[i]))
+        latest = self.x_data[0][-1]
+        self.plot.setXRange(max(0.0, latest - 2.0), latest + 0.05, padding=0)
 
     # Limpia la gráfica visualmente
     def reset_view(self):
-        self.x.clear()
-        self.y.clear()
-        self.curve.setData([], [])
+        for i in range(self.num_channels):
+            self.x_data[i].clear()
+            self.y_data[i].clear()
+            self.curves[i].setData([], [])
 
 
 
@@ -944,14 +795,14 @@ class SensorTab(QWidget):
 
         # Crea 3 monitores
         self.m1 = MonitorEMG("EMG 1", channel_index=0)
-        self.m2 = MonitorEMG("Giroscopio", channel_index=1)
+        self.m2 = MonitorEMG("Giroscopio", channel_index=1, num_channels=3)
         self.m3 = MonitorEMG("Acelerómetro", channel_index=2)
 
         # Timer para refrescar interfaz
         self.timer = QTimer(self)
 
-        # Intervalo 20 ms
-        self.timer.setInterval(20)
+        # Intervalo 10 ms (refresh a 100 Hz, reduce el delay percibido del giroscopio)
+        self.timer.setInterval(10)
 
         # Al expirar, jala la última muestra
         self.timer.timeout.connect(self.pull_and_update)
@@ -1107,18 +958,23 @@ class SensorTab(QWidget):
 
         for s in samples:
             v = s.values
-            if len(v) >= 3:
-                self.m1.push_sample(s.t, v[0])
-                self.m2.push_sample(s.t, v[1])
-                self.m3.push_sample(s.t, v[2])
+            if len(v) >= 1:
+                self.m1.push_sample(s.t, [v[0]])
+            if len(v) >= 4:
+                self.m2.push_sample(s.t, [v[1], v[2], v[3]])
 
-                if self.active_session is not None:
-                    self.active_session["samples"].append({
-                        "t": float(s.t),
-                        "emg": float(v[0]),
-                        "gyro": float(v[1]),
-                        "accel": float(v[2])
-                    })
+            if self.active_session is not None:
+                self.active_session["samples"].append({
+                    "t":   float(s.t),
+                    "emg": float(v[0]) if len(v) > 0 else 0.0,
+                    "gx":  float(v[1]) if len(v) > 1 else 0.0,
+                    "gy":  float(v[2]) if len(v) > 2 else 0.0,
+                    "gz":  float(v[3]) if len(v) > 3 else 0.0,
+                })
+
+        # Redibuja una sola vez por ciclo del timer (no por cada muestra)
+        self.m1.flush()
+        self.m2.flush()
 
         self.last_sample_time = samples[-1].t
 
@@ -1490,14 +1346,16 @@ class VentanaPrincipal(QMainWindow):
                 "<br><b>Primera muestra:</b><br>"
                 f"t={primero.get('t', 0):.4f}, "
                 f"EMG={primero.get('emg', 0):.4f}, "
-                f"Giro={primero.get('gyro', 0):.4f}, "
-                f"Acel={primero.get('accel', 0):.4f}<br><br>"
+                f"Gx={primero.get('gx', 0):.4f}, "
+                f"Gy={primero.get('gy', 0):.4f}, "
+                f"Gz={primero.get('gz', 0):.4f}<br><br>"
 
                 "<b>Última muestra:</b><br>"
                 f"t={ultimo.get('t', 0):.4f}, "
                 f"EMG={ultimo.get('emg', 0):.4f}, "
-                f"Giro={ultimo.get('gyro', 0):.4f}, "
-                f"Acel={ultimo.get('accel', 0):.4f}"
+                f"Gx={ultimo.get('gx', 0):.4f}, "
+                f"Gy={ultimo.get('gy', 0):.4f}, "
+                f"Gz={ultimo.get('gz', 0):.4f}"
             )
 
         # Muestra detalle en interfaz
@@ -1554,7 +1412,7 @@ class VentanaPrincipal(QMainWindow):
                         # Encabezados
                         writer.writerow([
                             "patient_id", "patient_name", "session_id", "study_name",
-                            "sensor_tab", "created_at", "t", "emg", "gyro", "accel"
+                            "sensor_tab", "created_at", "t", "emg", "gx", "gy", "gz"
                         ])
 
                         # Escribe una fila por muestra
@@ -1568,8 +1426,9 @@ class VentanaPrincipal(QMainWindow):
                                 sesion.get("created_at", ""),
                                 sample.get("t", ""),
                                 sample.get("emg", ""),
-                                sample.get("gyro", ""),
-                                sample.get("accel", "")
+                                sample.get("gx", ""),
+                                sample.get("gy", ""),
+                                sample.get("gz", "")
                             ])
 
             # Mensaje de éxito
@@ -1686,3 +1545,8 @@ class VentanaPrincipal(QMainWindow):
 
 # RUN
 
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    ventana = VentanaPrincipal()
+    ventana.show()
+    sys.exit(app.exec())
